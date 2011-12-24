@@ -161,8 +161,6 @@ if test "$PHP_MEMCACHED" != "no"; then
     fi
   fi
 
-  AC_CHECK_FUNCS(memcached_touch)
-
   if test "$PHP_MEMCACHED_IGBINARY" != "no"; then
     AC_MSG_CHECKING([for igbinary includes])
     igbinary_inc_path=""
@@ -239,6 +237,13 @@ if test "$PHP_MEMCACHED" != "no"; then
     AC_MSG_CHECKING([whether to enable sasl support])
     AC_MSG_RESULT([$memcached_enable_sasl])
   fi
+
+  PHP_CHECK_LIBRARY(memcached, memcached_touch,
+  [
+  	AC_DEFINE(HAVE_MEMCACHED_TOUCH, 1, [ ])
+  ],[],[
+  	-L$PHP_LIBMEMCACHED_DIR/$PHP_LIBDIR
+  ])
 
   AC_MSG_CHECKING([for libmemcached location])
   if test "$PHP_LIBMEMCACHED_DIR" = "no"; then

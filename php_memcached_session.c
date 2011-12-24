@@ -141,7 +141,7 @@ error:
 		memc_sess->is_persisent = 0;
 	}
 
-	if (!strstr(p, "--SERVER")) {
+	if (!strstr(p, "--SERVER") && !strstr(p, "--SOCKET")) {
 		memcached_server_st *servers = memcached_servers_parse(p);
 		if (servers) {
 			memc_sess->memc_sess = memcached_create(NULL);
