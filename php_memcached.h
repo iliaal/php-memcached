@@ -105,6 +105,15 @@ typedef struct {
 
 int php_memc_sess_list_entry(void);
 
+#define MEMC_VAL_COMPRESSED    (1<<4)
+#define MEMC_VAL_COMPRESSION_ZLIB    (1<<5)
+#define MEMC_VAL_COMPRESSION_FASTLZ  (1<<6)
+
+enum memcached_compression_type {
+	COMPRESSION_TYPE_ZLIB = 1,
+	COMPRESSION_TYPE_FASTLZ = 2,
+};
+
 #endif /* PHP_MEMCACHED_H */
 
 /*

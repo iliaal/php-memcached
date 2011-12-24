@@ -127,10 +127,6 @@ typedef unsigned long int uint32_t;
 #define MEMC_VAL_IS_IGBINARY   5
 #define MEMC_VAL_IS_JSON       6
 
-#define MEMC_VAL_COMPRESSED    (1<<4)
-#define MEMC_VAL_COMPRESSION_ZLIB    (1<<5)
-#define MEMC_VAL_COMPRESSION_FASTLZ  (1<<6)
-
 /****************************************
   "get" operation flags
 ****************************************/
@@ -175,10 +171,6 @@ typedef unsigned long int uint32_t;
 /****************************************
   Structures and definitions
 ****************************************/
-enum memcached_compression_type {
-	COMPRESSION_TYPE_ZLIB = 1,
-	COMPRESSION_TYPE_FASTLZ = 2,
-};
 
 typedef struct {
 	zend_object zo;
@@ -1113,6 +1105,7 @@ PHP_METHOD(Memcached, setByKey)
 }
 /* }}} */
 
+#ifdef HAVE_MEMCACHED_TOUCH
 /* {{{ Memcached::touch(string key, [, int expiration ])
    Sets a new expiration for the given key */
 PHP_METHOD(Memcached, touch)
@@ -1128,8 +1121,7 @@ PHP_METHOD(Memcached, touchByKey)
     php_memc_store_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU, MEMC_OP_TOUCH, 1);
 }
 /* }}} */
-
-
+#endif
 
 /* {{{ Memcached::setMulti(array items [, int expiration ])
    Sets the keys/values specified in the items array */
@@ -1396,12 +1388,12 @@ static void php_memc_store_impl(INTERNAL_FUNCTION_PARAMETERS, int op, zend_bool 
 		}
 		flags |= MEMC_VAL_COMPRESSED;
 	}
-
+#ifdef HAVE_MEMCACHED_TOUCH
 	if (op == MEMC_OP_TOUCH && !memcached_behavior_get(m_obj->memc, MEMCACHED_BEHAVIOR_BINARY_PROTOCOL)) {
 		php_error_docref(NULL TSRMLS_CC, E_WARNING, "touch is only supported with binary protocol");
 		RETURN_FALSE;
 	}
-
+#endif
 	payload = php_memc_zval_to_payload(value, &payload_len, &flags, m_obj->serializer, m_obj->compression_type TSRMLS_CC);
 	if (payload == NULL) {
 		i_obj->rescode = MEMC_RES_PAYLOAD_FAILURE;
@@ -1417,7 +1409,7 @@ retry:
 										  key_len, payload, payload_len, expiration, flags);
 			}
 			break;
-
+#ifdef HAVE_MEMCACHED_TOUCH
 		case MEMC_OP_TOUCH:
 			if (!server_key) {
 				status = memcached_touch(m_obj->memc, key, key_len, expiration);
@@ -1426,7 +1418,7 @@ retry:
 										  key_len, expiration);
 			}
 			break;
-
+#endif
 
 		case MEMC_OP_ADD:
 			if (!server_key) {
@@ -3288,6 +3280,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_setByKey, 0, 0, 3)
 	ZEND_ARG_INFO(0, expiration)
 ZEND_END_ARG_INFO()
 
+#ifdef HAVE_MEMCACHED_TOUCH
 ZEND_BEGIN_ARG_INFO_EX(arginfo_touch, 0, 0, 2)
 	ZEND_ARG_INFO(0, key)
 	ZEND_ARG_INFO(0, expiration)
@@ -3298,6 +3291,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_touchByKey, 0, 0, 3)
 	ZEND_ARG_INFO(0, key)
 	ZEND_ARG_INFO(0, expiration)
 ZEND_END_ARG_INFO()
+#endif
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_setMulti, 0, 0, 1)
 	ZEND_ARG_ARRAY_INFO(0, items, 0)
@@ -3509,8 +3503,10 @@ static zend_function_entry memcached_class_methods[] = {
 
 	MEMC_ME(set,                arginfo_set)
 	MEMC_ME(setByKey,           arginfo_setByKey)
+#ifdef HAVE_MEMCACHED_TOUCH
 	MEMC_ME(touch,              arginfo_touch)
 	MEMC_ME(touchByKey,         arginfo_touchByKey)
+#endif
 	MEMC_ME(setMulti,           arginfo_setMulti)
 	MEMC_ME(setMultiByKey,      arginfo_setMultiByKey)
 

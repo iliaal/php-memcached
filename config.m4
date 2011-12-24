@@ -161,6 +161,8 @@ if test "$PHP_MEMCACHED" != "no"; then
     fi
   fi
 
+  AC_CHECK_FUNCS(memcached_touch)
+
   if test "$PHP_MEMCACHED_IGBINARY" != "no"; then
     AC_MSG_CHECKING([for igbinary includes])
     igbinary_inc_path=""

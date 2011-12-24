@@ -35,6 +35,9 @@
 #include "php_memcached.h"
 #include "php_memcached_session.h"
 
+#include "fastlz/fastlz.h"
+#include <zlib.h>
+
 extern ZEND_DECLARE_MODULE_GLOBALS(php_memcached)
 
 #define MEMC_SESS_DEFAULT_LOCK_WAIT 150000
@@ -123,6 +126,9 @@ error:
 			if (le->type == php_memc_sess_list_entry()) {
 				memc_sess = (struct memcached_sess *) le->ptr;
 				PS_SET_MOD_DATA(memc_sess);
+				if (plist_key) {
+					efree(plist_key);
+				}
 				return SUCCESS;
 			}
 		}
@@ -217,6 +223,32 @@ PS_CLOSE_FUNC(memcached)
 	return SUCCESS;
 }
 
+#define MEMC_FAILOVER_RETRY \
+		if (!server_count) {	\
+			server_count = memcached_server_count(memc_sess->memc_sess);	\
+		}	\
+		if (server_count > 1 && retry < server_count) {	\
+			switch (status) { 	\
+				case MEMCACHED_HOST_LOOKUP_FAILURE:	\
+				case MEMCACHED_CONNECTION_FAILURE:	\
+				case MEMCACHED_CONNECTION_BIND_FAILURE:	\
+				case MEMCACHED_WRITE_FAILURE:	\
+				case MEMCACHED_READ_FAILURE:	\
+				case MEMCACHED_UNKNOWN_READ_FAILURE:	\
+				case MEMCACHED_PROTOCOL_ERROR:	\
+				case MEMCACHED_SERVER_ERROR:	\
+				case MEMCACHED_CONNECTION_SOCKET_CREATE_FAILURE:	\
+				case MEMCACHED_TIMEOUT:	\
+				case MEMCACHED_FAIL_UNIX_SOCKET:	\
+				case MEMCACHED_SERVER_MARKED_DEAD:	\
+					retry++;	\
+					continue;	\
+				default:	\
+					break;	\
+			}	\
+		}	\
+
+
 PS_READ_FUNC(memcached)
 {
 	char *payload = NULL;
@@ -226,6 +258,7 @@ PS_READ_FUNC(memcached)
 	memcached_return status;
 	memcached_sess *memc_sess = PS_GET_MOD_DATA();
 	size_t key_length;
+	int server_count = 0, retry = 0;
 
 	key_length = strlen(MEMC_G(sess_prefix)) + key_len + 5; // prefix + "lock."
 	if (!key_length || key_length >= MEMCACHED_MAX_KEY) {
@@ -240,14 +273,46 @@ PS_READ_FUNC(memcached)
 		}
 	}
 
-	payload = memcached_get(memc_sess->memc_sess, key, key_len, &payload_len, &flags, &status);
+	while (1) {
+		payload = memcached_get(memc_sess->memc_sess, key, key_len, &payload_len, &flags, &status);
 
-	if (status == MEMCACHED_SUCCESS) {
-		*val = estrndup(payload, payload_len);
-		*vallen = payload_len;
-		free(payload);
-		return SUCCESS;
-	} else {
+		if (status == MEMCACHED_SUCCESS) {
+			char *p = payload;
+			if (flags & MEMC_VAL_COMPRESSION_FASTLZ || flags & MEMC_VAL_COMPRESSION_ZLIB) {
+				uint32_t len;
+				zend_bool decompress_status;
+				char *dval;
+				size_t dval_len;
+
+				memcpy(&len, payload, sizeof(uint32_t));
+				dval = emalloc(len + 1);
+				payload_len -= sizeof(uint32_t);
+				payload += sizeof(uint32_t);
+
+				if (flags & MEMC_VAL_COMPRESSION_FASTLZ) {
+					decompress_status = ((dval_len = fastlz_decompress(payload, payload_len, dval, len)) > 0);
+					dval[dval_len] = '\0';
+				} else if (flags & MEMC_VAL_COMPRESSION_ZLIB) {
+					decompress_status = (uncompress((Bytef *)dval, len, (Bytef *)payload, payload_len) == Z_OK);
+				}
+
+				if (!decompress_status) {
+					php_error_docref(NULL TSRMLS_CC, E_WARNING, "could not decompress value");
+					free(p);
+					efree(dval);
+					return FAILURE;
+				}
+				*val = dval;
+				*vallen = dval_len;
+			} else {
+				*val = estrndup(payload, payload_len);
+				*vallen = payload_len;
+			}
+			free(p);
+			return SUCCESS;
+		}
+		MEMC_FAILOVER_RETRY
+
 		return FAILURE;
 	}
 }
@@ -259,6 +324,10 @@ PS_WRITE_FUNC(memcached)
 	memcached_return status;
 	memcached_sess *memc_sess = PS_GET_MOD_DATA();
 	size_t key_length;
+	int server_count = 0, retry = 0;
+	uint32_t flags = 0;
+	size_t final_val_len;
+	char *final_val;
 
 	key_length = strlen(MEMC_G(sess_prefix)) + key_len + 5; // prefix + "lock."
 	if (!key_length || key_length >= MEMCACHED_MAX_KEY) {
@@ -270,11 +339,51 @@ PS_WRITE_FUNC(memcached)
 	if (PS(gc_maxlifetime) > 0) {
 		expiration = PS(gc_maxlifetime);
 	}
-	status = memcached_set(memc_sess->memc_sess, key, key_len, val, vallen, expiration, 0);
 
-	if (status == MEMCACHED_SUCCESS) {
-		return SUCCESS;
+	if (vallen > MEMC_G(compression_threshold) && MEMC_G(compression_type_real)) {
+		zend_bool compress_status = 0;
+		uint32_t len = vallen;
+		unsigned long payload_comp_len = (unsigned long)((vallen * 1.05) + 1);
+		char *payload_comp = emalloc(payload_comp_len + sizeof(uint32_t));
+		char *payload = payload_comp;
+		memcpy(payload_comp, &len, sizeof(uint32_t));
+		payload_comp += sizeof(uint32_t);
+
+		if (MEMC_G(compression_type_real) == COMPRESSION_TYPE_FASTLZ) {
+			compress_status = ((payload_comp_len = fastlz_compress(val, vallen, payload_comp)) > 0);
+			flags |= MEMC_VAL_COMPRESSION_FASTLZ;
+		} else if (MEMC_G(compression_type_real) == COMPRESSION_TYPE_ZLIB) {
+			compress_status = (compress((Bytef *)payload_comp, &payload_comp_len, (Bytef *)val, vallen) == Z_OK);
+			flags |= MEMC_VAL_COMPRESSION_ZLIB;
+		}
+
+		if (!compress_status) {
+			php_error_docref(NULL TSRMLS_CC, E_WARNING, "could not compress value");
+			efree(payload);
+			return FAILURE;
+		}
+
+		final_val = payload;
+		final_val_len = payload_comp_len +  sizeof(uint32_t);
+		final_val[final_val_len] = '\0';
 	} else {
+		final_val_len = vallen;
+		final_val = val;
+	}
+
+	while (1) {
+		status = memcached_set(memc_sess->memc_sess, key, key_len, final_val, final_val_len, expiration, flags);
+		if (status == MEMCACHED_SUCCESS) {
+			if (final_val != val) {
+				efree(final_val);
+			}
+			return SUCCESS;
+		}
+		MEMC_FAILOVER_RETRY
+
+		if (final_val != val) {
+			efree(final_val);
+		}
 		return FAILURE;
 	}
 }
