@@ -19,7 +19,7 @@
 #ifndef PHP_MEMCACHED_H
 #define PHP_MEMCACHED_H
 
-#include <libmemcached/memcached.h>
+#include "php_libmemcached_compat.h"
 
 #ifdef HAVE_CONFIG_H
 # include "config.h"
@@ -66,6 +66,11 @@ ZEND_BEGIN_MODULE_GLOBALS(php_memcached)
 	zend_bool sess_locked;
 	char* sess_lock_key;
 	int   sess_lock_key_len;
+
+	int   sess_number_of_replicas;
+	zend_bool sess_randomize_replica_read;
+	zend_bool sess_remove_failed_enabled;
+	zend_bool sess_consistent_hashing_enabled;
 #endif
 	char *serializer_name;
 	enum memcached_serializer serializer;
@@ -78,6 +83,8 @@ ZEND_BEGIN_MODULE_GLOBALS(php_memcached)
 #if HAVE_MEMCACHED_SASL
 	bool use_sasl;
 #endif
+	zend_bool sess_consistent_hash_enabled;
+	zend_bool sess_binary_enabled;
 ZEND_END_MODULE_GLOBALS(php_memcached)
 
 PHP_MEMCACHED_API zend_class_entry *php_memc_get_ce(void);
@@ -90,7 +97,7 @@ PHP_MINIT_FUNCTION(memcached);
 PHP_MSHUTDOWN_FUNCTION(memcached);
 PHP_MINFO_FUNCTION(memcached);
 
-#define PHP_MEMCACHED_VERSION "2.0.0-dev"
+#define PHP_MEMCACHED_VERSION "2.1.0"
 
 #ifdef ZTS
 #define MEMC_G(v) TSRMG(php_memcached_globals_id, zend_php_memcached_globals *, v)

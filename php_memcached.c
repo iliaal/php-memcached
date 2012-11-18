@@ -43,9 +43,7 @@
 #include <ext/standard/php_smart_str.h>
 #include <ext/standard/php_var.h>
 #include <ext/standard/basic_functions.h>
-#include <libmemcached/memcached.h>
 
-#include "php_libmemcached_compat.h"
 #include "php_memcached.h"
 #include "g_fmt.h"
 
@@ -127,6 +125,10 @@ typedef unsigned long int uint32_t;
 #define MEMC_VAL_IS_IGBINARY   5
 #define MEMC_VAL_IS_JSON       6
 
+#define MEMC_VAL_COMPRESSED    (1<<4)
+#define MEMC_VAL_COMPRESSION_ZLIB    (1<<5)
+#define MEMC_VAL_COMPRESSION_FASTLZ  (1<<6)
+
 /****************************************
   "get" operation flags
 ****************************************/
@@ -168,9 +170,19 @@ typedef unsigned long int uint32_t;
 
 #define RETURN_FROM_GET RETURN_FALSE
 
+#if (PHP_MAJOR_VERSION == 5) && (PHP_MINOR_VERSION < 3)
+#define zend_parse_parameters_none()                                        \
+	    zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "")
+#endif
+
+
 /****************************************
   Structures and definitions
 ****************************************/
+enum memcached_compression_type {
+	COMPRESSION_TYPE_ZLIB = 1,
+	COMPRESSION_TYPE_FASTLZ = 2,
+};
 
 typedef struct {
 	zend_object zo;
@@ -273,8 +285,15 @@ static PHP_INI_MH(OnUpdateSerializer)
 PHP_INI_BEGIN()
 #ifdef HAVE_MEMCACHED_SESSION
 	STD_PHP_INI_ENTRY("memcached.sess_locking",		"1",		PHP_INI_ALL, OnUpdateBool,		sess_locking_enabled,	zend_php_memcached_globals,	php_memcached_globals)
+	STD_PHP_INI_ENTRY("memcached.sess_consistent_hash",	"0",		PHP_INI_ALL, OnUpdateBool,		sess_consistent_hash_enabled,	zend_php_memcached_globals,	php_memcached_globals)
+	STD_PHP_INI_ENTRY("memcached.sess_binary",		"0",		PHP_INI_ALL, OnUpdateBool,		sess_binary_enabled,	zend_php_memcached_globals,	php_memcached_globals)
 	STD_PHP_INI_ENTRY("memcached.sess_lock_wait",		"150000",	PHP_INI_ALL, OnUpdateLongGEZero,sess_lock_wait,			zend_php_memcached_globals,	php_memcached_globals)
 	STD_PHP_INI_ENTRY("memcached.sess_prefix",		"memc.sess.key.",	PHP_INI_ALL, OnUpdateString, sess_prefix,		zend_php_memcached_globals,	php_memcached_globals)
+
+	STD_PHP_INI_ENTRY("memcached.sess_number_of_replicas",	"0",	PHP_INI_ALL, OnUpdateLongGEZero,	sess_number_of_replicas,	zend_php_memcached_globals,	php_memcached_globals)
+	STD_PHP_INI_ENTRY("memcached.sess_randomize_replica_read",	"0",	PHP_INI_ALL, OnUpdateBool,	sess_randomize_replica_read,	zend_php_memcached_globals,	php_memcached_globals)
+	STD_PHP_INI_ENTRY("memcached.sess_consistent_hashing",	"0",		PHP_INI_ALL, OnUpdateBool,              sess_consistent_hashing_enabled,	zend_php_memcached_globals,     php_memcached_globals)
+	STD_PHP_INI_ENTRY("memcached.sess_remove_failed",	"0",		PHP_INI_ALL, OnUpdateBool,              sess_remove_failed_enabled,	zend_php_memcached_globals,     php_memcached_globals)
 #endif
 	STD_PHP_INI_ENTRY("memcached.compression_type",		"fastlz",	PHP_INI_ALL, OnUpdateCompressionType, compression_type,		zend_php_memcached_globals,	php_memcached_globals)
 	STD_PHP_INI_ENTRY("memcached.compression_factor",	"1.3",		PHP_INI_ALL, OnUpdateReal, compression_factor,		zend_php_memcached_globals,	php_memcached_globals)
@@ -1105,7 +1124,7 @@ PHP_METHOD(Memcached, setByKey)
 }
 /* }}} */
 
-#ifdef HAVE_MEMCACHED_TOUCH
+#if defined(LIBMEMCACHED_VERSION_HEX) && LIBMEMCACHED_VERSION_HEX >= 0x01000002
 /* {{{ Memcached::touch(string key, [, int expiration ])
    Sets a new expiration for the given key */
 PHP_METHOD(Memcached, touch)
@@ -1122,6 +1141,7 @@ PHP_METHOD(Memcached, touchByKey)
 }
 /* }}} */
 #endif
+
 
 /* {{{ Memcached::setMulti(array items [, int expiration ])
    Sets the keys/values specified in the items array */
@@ -1156,6 +1176,7 @@ PHP_METHOD(Memcached, setMultiByKey)
 			case MEMCACHED_SERVER_MARKED_DEAD:	\
 				if (memcached_server_count(m_obj->memc) > 0) {	\
 					retry++;	\
+					i_obj->rescode = 0;	\
 					goto retry;	\
 				}	\
 				break;	\
@@ -1388,16 +1409,18 @@ static void php_memc_store_impl(INTERNAL_FUNCTION_PARAMETERS, int op, zend_bool 
 		}
 		flags |= MEMC_VAL_COMPRESSED;
 	}
-#ifdef HAVE_MEMCACHED_TOUCH
-	if (op == MEMC_OP_TOUCH && !memcached_behavior_get(m_obj->memc, MEMCACHED_BEHAVIOR_BINARY_PROTOCOL)) {
-		php_error_docref(NULL TSRMLS_CC, E_WARNING, "touch is only supported with binary protocol");
-		RETURN_FALSE;
-	}
-#endif
-	payload = php_memc_zval_to_payload(value, &payload_len, &flags, m_obj->serializer, m_obj->compression_type TSRMLS_CC);
-	if (payload == NULL) {
-		i_obj->rescode = MEMC_RES_PAYLOAD_FAILURE;
-		RETURN_FALSE;
+
+	if (op == MEMC_OP_TOUCH) {
+		if (!memcached_behavior_get(m_obj->memc, MEMCACHED_BEHAVIOR_BINARY_PROTOCOL)) {
+			php_error_docref(NULL TSRMLS_CC, E_WARNING, "touch is only supported with binary protocol");
+			RETURN_FALSE;
+		}
+	} else {
+		payload = php_memc_zval_to_payload(value, &payload_len, &flags, m_obj->serializer, m_obj->compression_type TSRMLS_CC);
+		if (payload == NULL) {
+			i_obj->rescode = MEMC_RES_PAYLOAD_FAILURE;
+			RETURN_FALSE;
+		}
 	}
 retry:
 	switch (op) {
@@ -1409,7 +1432,7 @@ retry:
 										  key_len, payload, payload_len, expiration, flags);
 			}
 			break;
-#ifdef HAVE_MEMCACHED_TOUCH
+
 		case MEMC_OP_TOUCH:
 			if (!server_key) {
 				status = memcached_touch(m_obj->memc, key, key_len, expiration);
@@ -1418,7 +1441,7 @@ retry:
 										  key_len, expiration);
 			}
 			break;
-#endif
+
 
 		case MEMC_OP_ADD:
 			if (!server_key) {
@@ -1468,7 +1491,10 @@ retry:
 	} else {
 		RETVAL_TRUE;
 	}
-	efree(payload);
+
+	if (op != MEMC_OP_TOUCH) {
+		efree(payload);
+	}
 }
 /* }}} */
 
@@ -1965,12 +1991,6 @@ PHP_METHOD(Memcached, getServerByKey)
 	add_assoc_string(return_value, "host", server->hostname, 1);
 	add_assoc_long(return_value, "port", server->port);
 	add_assoc_long(return_value, "weight", server->weight);
-
-	/* memcached_server_add(3) states that the server instance is cloned. */
-	/* In actuality it is not, possibly a bug in libmemcached 0.40. */
-	/* remove server freeing */
-
-	/* memcached_server_free(server); */
 }
 /* }}} */
 
@@ -2161,8 +2181,8 @@ static PHP_METHOD(Memcached, getOption)
 			char *result;
 
 			result = memcached_callback_get(m_obj->memc, MEMCACHED_CALLBACK_PREFIX_KEY, &retval);
-			if (retval == MEMCACHED_SUCCESS) {
-#if defined(LIBMEMCACHED_VERSION_HEX) && LIBMEMCACHED_VERSION_HEX < 0x00050000
+			if (retval == MEMCACHED_SUCCESS && result) {
+#if defined(LIBMEMCACHED_VERSION_HEX) && LIBMEMCACHED_VERSION_HEX == 0x00049000
 				RETURN_STRINGL(result, strlen(result) - 1,  1);
 #else
 				RETURN_STRING(result, 1);
@@ -2219,7 +2239,7 @@ static int php_memc_set_option(php_memc_t *i_obj, long option, zval *value TSRML
 		case MEMC_OPT_PREFIX_KEY:
 		{
 			char *key;
-#if defined(LIBMEMCACHED_VERSION_HEX) && LIBMEMCACHED_VERSION_HEX < 0x00050000
+#if defined(LIBMEMCACHED_VERSION_HEX) && LIBMEMCACHED_VERSION_HEX == 0x00049000
 			char tmp[MEMCACHED_PREFIX_KEY_MAX_SIZE - 1];
 #endif
 			convert_to_string(value);
@@ -2227,10 +2247,10 @@ static int php_memc_set_option(php_memc_t *i_obj, long option, zval *value TSRML
 				key = NULL;
 			} else {
 				/*
-				   work-around a bug in libmemcached prior to version 0.50 that truncates the trailing
+				   work-around a bug in libmemcached in version 0.49 that truncates the trailing
 				   character of the key prefix, to avoid the issue we pad it with a '0'
 				*/
-#if defined(LIBMEMCACHED_VERSION_HEX) && LIBMEMCACHED_VERSION_HEX < 0x00050000
+#if defined(LIBMEMCACHED_VERSION_HEX) && LIBMEMCACHED_VERSION_HEX == 0x00049000
 				snprintf(tmp, sizeof(tmp), "%s0", Z_STRVAL_P(value));
 				key = tmp;
 #else
@@ -2567,9 +2587,13 @@ static memcached_return php_memc_do_serverlist_callback(const memcached_st *ptr,
 
 	MAKE_STD_ZVAL(array);
 	array_init(array);
-	add_assoc_string(array, "host", instance->hostname, 1);
-	add_assoc_long(array, "port", instance->port);
+	add_assoc_string(array, "host", memcached_server_name(instance), 1);
+	add_assoc_long(array, "port", memcached_server_port(instance));
+	/*
+	 * API does not allow to get at this field.
 	add_assoc_long(array, "weight", instance->weight);
+	*/
+
 	add_next_index_zval(context->return_value, array);
 	return MEMCACHED_SUCCESS;
 }
@@ -2580,7 +2604,7 @@ static memcached_return php_memc_do_stats_callback(const memcached_st *ptr, memc
 	int hostport_len;
 	struct callbackContext* context = (struct callbackContext*) in_context;
 	zval *entry;
-	hostport_len = spprintf(&hostport, 0, "%s:%d", instance->hostname, instance->port);
+	hostport_len = spprintf(&hostport, 0, "%s:%d", memcached_server_name(instance), memcached_server_port(instance));
 
 	MAKE_STD_ZVAL(entry);
 	array_init(entry);
@@ -2625,10 +2649,18 @@ static memcached_return php_memc_do_version_callback(const memcached_st *ptr, me
 	int hostport_len, version_len;
 	struct callbackContext* context = (struct callbackContext*) in_context;
 
-	hostport_len = spprintf(&hostport, 0, "%s:%d", instance->hostname, instance->port);
+	hostport_len = spprintf(&hostport, 0, "%s:%d", memcached_server_name(instance), memcached_server_port(instance));
+#if defined(LIBMEMCACHED_VERSION_HEX) && LIBMEMCACHED_VERSION_HEX >= 0x01000008
 	version_len = snprintf(version, sizeof(version), "%d.%d.%d",
-				instance->major_version, instance->minor_version,
+				memcached_server_major_version(instance),
+				memcached_server_minor_version(instance),
+				memcached_server_micro_version(instance));
+#else
+	version_len = snprintf(version, sizeof(version), "%d.%d.%d",
+				instance->major_version,
+				instance->minor_version,
 				instance->micro_version);
+#endif
 
 	add_assoc_stringl_ex(context->return_value, hostport, hostport_len+1, version, version_len, 1);
 	efree(hostport);
@@ -3009,11 +3041,17 @@ static void php_memc_init_globals(zend_php_memcached_globals *php_memcached_glob
 {
 #ifdef HAVE_MEMCACHED_SESSION
 	MEMC_G(sess_locking_enabled) = 1;
+	MEMC_G(sess_binary_enabled) = 1;
+	MEMC_G(sess_consistent_hashing_enabled) = 0;
+	MEMC_G(sess_number_of_replicas) = 0;
+	MEMC_G(sess_remove_failed_enabled) = 0;
 	MEMC_G(sess_prefix) = NULL;
 	MEMC_G(sess_lock_wait) = 0;
 	MEMC_G(sess_locked) = 0;
 	MEMC_G(sess_lock_key) = NULL;
 	MEMC_G(sess_lock_key_len) = 0;
+	MEMC_G(sess_number_of_replicas) = 0;
+	MEMC_G(sess_randomize_replica_read) = 0;
 #endif
 	MEMC_G(serializer_name) = NULL;
 	MEMC_G(serializer) = SERIALIZER_DEFAULT;
@@ -3280,7 +3318,6 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_setByKey, 0, 0, 3)
 	ZEND_ARG_INFO(0, expiration)
 ZEND_END_ARG_INFO()
 
-#ifdef HAVE_MEMCACHED_TOUCH
 ZEND_BEGIN_ARG_INFO_EX(arginfo_touch, 0, 0, 2)
 	ZEND_ARG_INFO(0, key)
 	ZEND_ARG_INFO(0, expiration)
@@ -3291,7 +3328,6 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_touchByKey, 0, 0, 3)
 	ZEND_ARG_INFO(0, key)
 	ZEND_ARG_INFO(0, expiration)
 ZEND_END_ARG_INFO()
-#endif
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_setMulti, 0, 0, 1)
 	ZEND_ARG_ARRAY_INFO(0, items, 0)
@@ -3503,7 +3539,7 @@ static zend_function_entry memcached_class_methods[] = {
 
 	MEMC_ME(set,                arginfo_set)
 	MEMC_ME(setByKey,           arginfo_setByKey)
-#ifdef HAVE_MEMCACHED_TOUCH
+#if defined(LIBMEMCACHED_VERSION_HEX) && LIBMEMCACHED_VERSION_HEX >= 0x01000002
 	MEMC_ME(touch,              arginfo_touch)
 	MEMC_ME(touchByKey,         arginfo_touchByKey)
 #endif
@@ -3661,6 +3697,9 @@ static void php_memc_register_constants(INIT_FUNC_ARGS)
 	REGISTER_MEMC_CLASS_CONST_LONG(OPT_DISTRIBUTION, MEMCACHED_BEHAVIOR_DISTRIBUTION);
 	REGISTER_MEMC_CLASS_CONST_LONG(DISTRIBUTION_MODULA, MEMCACHED_DISTRIBUTION_MODULA);
 	REGISTER_MEMC_CLASS_CONST_LONG(DISTRIBUTION_CONSISTENT, MEMCACHED_DISTRIBUTION_CONSISTENT);
+#if defined(LIBMEMCACHED_VERSION_HEX) && LIBMEMCACHED_VERSION_HEX >= 0x00049000
+	REGISTER_MEMC_CLASS_CONST_LONG(DISTRIBUTION_VIRTUAL_BUCKET, MEMCACHED_DISTRIBUTION_VIRTUAL_BUCKET);
+#endif
 	REGISTER_MEMC_CLASS_CONST_LONG(OPT_LIBKETAMA_COMPATIBLE, MEMCACHED_BEHAVIOR_KETAMA_WEIGHTED);
 	REGISTER_MEMC_CLASS_CONST_LONG(OPT_LIBKETAMA_HASH, MEMCACHED_BEHAVIOR_KETAMA_HASH);
 	REGISTER_MEMC_CLASS_CONST_LONG(OPT_TCP_KEEPALIVE, MEMCACHED_BEHAVIOR_TCP_KEEPALIVE);
