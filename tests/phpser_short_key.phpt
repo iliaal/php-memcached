@@ -1,5 +1,5 @@
 --TEST--
-Memcached phpser serializer with a phpser.key that is too short fails closed
+Memcached phpser serializer rejects values when phpser.key is too short
 --SKIPIF--
 <?php
 include dirname(__FILE__) . "/skipif.inc";
