@@ -917,6 +917,31 @@ zend_bool s_invoke_cache_callback(zval *zobject, zend_fcall_info *fci, zend_fcal
   Wrapper for setting from zval
 ****************************************/
 
+#ifdef HAVE_MEMCACHED_PHPSER
+/* phpser has no API that reports whether signing is active, so apply its own
+ * rule: a non-empty phpser.key means values must verify. A key shorter than
+ * phpser accepts also counts, because phpser then rejects every value. */
+static
+zend_bool s_phpser_key_set(void)
+{
+	zend_ini_entry *entry = zend_hash_str_find_ptr(EG(ini_directives), "phpser.key", sizeof("phpser.key") - 1);
+
+	return entry && entry->value && ZSTR_LEN(entry->value) > 0;
+}
+#endif
+
+/* With signed phpser, only verified phpser items and native integers and
+ * floats are read back; every other value type is written through phpser. */
+static
+zend_bool s_phpser_keyed(php_memc_serializer_type serializer)
+{
+#ifdef HAVE_MEMCACHED_PHPSER
+	return serializer == SERIALIZER_PHPSER && s_phpser_key_set();
+#else
+	return 0;
+#endif
+}
+
 static
 zend_bool s_compress_value (php_memc_compression_type compression_type, zend_long compression_level, zend_string **payload_in, uint32_t *flags)
 {
@@ -1131,10 +1156,15 @@ zend_string *s_zval_to_payload(php_memc_object_t *intern, zval *value, uint32_t 
 	zend_string *payload;
 	php_memc_user_data_t *memc_user_data = memcached_get_user_data(intern->memc);
 	zend_bool should_compress = memc_user_data->compression_enabled;
+	zend_bool phpser_keyed = s_phpser_keyed(memc_user_data->serializer);
 
 	switch (Z_TYPE_P(value)) {
 
 		case IS_STRING:
+			if (phpser_keyed) {
+				payload = s_serialize_payload(memc_user_data->serializer, value, flags);
+				break;
+			}
 			payload = zval_get_string(value);
 			MEMC_VAL_SET_TYPE(*flags, MEMC_VAL_IS_STRING);
 			break;
@@ -1162,12 +1192,20 @@ zend_string *s_zval_to_payload(php_memc_object_t *intern, zval *value, uint32_t 
 			break;
 
 		case IS_TRUE:
+			if (phpser_keyed) {
+				payload = s_serialize_payload(memc_user_data->serializer, value, flags);
+				break;
+			}
 			payload = zend_string_init ("1", 1, 0);
 			MEMC_VAL_SET_TYPE(*flags, MEMC_VAL_IS_BOOL);
 			should_compress = 0;
 			break;
 
 		case IS_FALSE:
+			if (phpser_keyed) {
+				payload = s_serialize_payload(memc_user_data->serializer, value, flags);
+				break;
+			}
 			payload = zend_string_alloc (0, 0);
 			MEMC_VAL_SET_TYPE(*flags, MEMC_VAL_IS_BOOL);
 			should_compress = 0;
@@ -2188,6 +2226,14 @@ static void php_memc_store_impl(INTERNAL_FUNCTION_PARAMETERS, int op, zend_bool 
 		 */
 		if (op == MEMC_OP_APPEND || op == MEMC_OP_PREPEND) {
 			php_error_docref(NULL, E_WARNING, "cannot append/prepend with compression turned on");
+			RETURN_NULL();
+		}
+	}
+
+	if (s_phpser_keyed(memc_user_data->serializer)) {
+		/* Appending to a signed value breaks its tag, so it would read back as false */
+		if (op == MEMC_OP_APPEND || op == MEMC_OP_PREPEND) {
+			php_error_docref(NULL, E_WARNING, "cannot append/prepend with the phpser serializer when phpser.key is set");
 			RETURN_NULL();
 		}
 	}
@@ -3882,7 +3928,8 @@ zend_bool s_unserialize_value (memcached_st *memc, int val_type, zend_string *pa
 
 			if (rc != PHPSER_API_OK) {
 				ZVAL_FALSE(return_value);
-				if (rc == PHPSER_API_ERR && !EG(exception)) {
+				/* With phpser.key set, phpser itself reports every failure a forged value can cause */
+				if (rc == PHPSER_API_ERR && !EG(exception) && !s_phpser_key_set()) {
 					php_error_docref(NULL, E_WARNING, "could not unserialize value with phpser");
 				}
 				return 0;
@@ -3929,6 +3976,7 @@ zend_bool s_memcached_result_to_zval(memcached_st *memc, memcached_result_st *re
 	size_t payload_len;
 	uint32_t flags;
 	zend_bool retval = 1;
+	php_memc_user_data_t *memc_user_data = memcached_get_user_data(memc);
 
 	payload     = memcached_result_value(result);
 	payload_len = memcached_result_length(result);
@@ -3937,6 +3985,22 @@ zend_bool s_memcached_result_to_zval(memcached_st *memc, memcached_result_st *re
 	if (!payload && payload_len > 0) {
 		php_error_docref(NULL, E_WARNING, "Could not handle non-existing value of length %zu", payload_len);
 		return 0;
+	}
+
+	/* The type comes from the stored flags, which whoever wrote the item chose,
+	 * so the configured serializer alone does not keep other decoders out. */
+	if (s_phpser_keyed(memc_user_data->serializer)) {
+		switch (MEMC_VAL_GET_TYPE(flags)) {
+			case MEMC_VAL_IS_PHPSER:
+			case MEMC_VAL_IS_LONG:
+			case MEMC_VAL_IS_DOUBLE:
+				break;
+
+			default:
+				php_error_docref(NULL, E_WARNING, "could not unserialize value: phpser.key is set and the value is not signed phpser");
+				ZVAL_FALSE(return_value);
+				return 0;
+		}
 	}
 
 	if (MEMC_VAL_HAS_FLAG(flags, MEMC_VAL_COMPRESSED)) {
