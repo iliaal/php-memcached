@@ -206,6 +206,10 @@ http://pear.php.net/dtd/package-2.0.xsd">
       <name>msgpack</name>
       <min>2.0</min>
     </extension>
+    <extension>
+      <name>phpser</name>
+      <min>0.9.0</min>
+    </extension>
   </optional>
  </dependencies>
  <providesextension>memcached</providesextension>
@@ -216,6 +220,7 @@ http://pear.php.net/dtd/package-2.0.xsd">
   <configureoption name="with-zstd"                 prompt="use system zstd library"    default="no"/>
   <configureoption name="enable-memcached-igbinary" prompt="enable igbinary serializer" default="no"/>
   <configureoption name="enable-memcached-msgpack"  prompt="enable msgpack serializer"  default="no"/>
+  <configureoption name="enable-memcached-phpser"   prompt="enable phpser serializer"   default="no"/>
   <configureoption name="enable-memcached-json"     prompt="enable json serializer"     default="no"/>
   <configureoption name="enable-memcached-protocol" prompt="enable server protocol"     default="no"/>
   <configureoption name="enable-memcached-sasl"     prompt="enable sasl"                default="yes"/>
