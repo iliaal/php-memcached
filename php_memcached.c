@@ -3795,12 +3795,20 @@ zend_string *s_decompress_value (const char *payload, size_t payload_len, uint32
 
 #ifdef HAVE_ZSTD_H
 	if (is_zstd) {
-		decompress_status = !ZSTD_isError(ZSTD_decompress(&buffer->val, buffer->len, payload, payload_len));
+		size_t zstd_length = ZSTD_decompress(&buffer->val, buffer->len, payload, payload_len);
+
+		decompress_status = !ZSTD_isError(zstd_length);
+		if (decompress_status) {
+			buffer->len = zstd_length;
+		}
 	}
 	else
 #endif
 	if (is_fastlz) {
 		decompress_status = ((length = fastlz_decompress(payload, payload_len, &buffer->val, buffer->len)) > 0);
+		if (decompress_status) {
+			buffer->len = length;
+		}
 	}
 	else if (is_zlib) {
 		unsigned long ds = buffer->len;
@@ -3809,14 +3817,13 @@ zend_string *s_decompress_value (const char *payload, size_t payload_len, uint32
 		buffer->len = ds;
 	}
 
-	ZSTR_VAL(buffer)[stored_length] = '\0';
-
 	if (!decompress_status) {
 		php_error_docref(NULL, E_WARNING, "could not decompress value");
 		zend_string_release (buffer);
 		return NULL;
 	}
 
+	ZSTR_VAL(buffer)[ZSTR_LEN(buffer)] = '\0';
 	zend_string_forget_hash_val(buffer);
 	return buffer;
 }
